@@ -49,10 +49,26 @@ alive = torch.cumprod(survival, dim=1)[:, -1:]                 # [B, 1]
 
 ---
 
-## 未改动的函数
+## 未改动的函数（算法核心）
 
-| 函数 | 说明 |
-|------|------|
-| `compute_aloe_critic_loss` | MSE(Q_pred, td_target)，未改动 |
-| `compute_aloe_advantage_and_weight` | A = Q_pess - V_pi，clip-exp 权重，未改动 |
-| `compute_aloe_actor_loss` | 加权 flow-matching MSE，未改动 |
+这三个函数是 ALOE 算法的主体，**本次没有改动，但是理解整个算法必须知道它们的作用**：
+
+### `compute_aloe_critic_loss(q_pred, td_target)`
+
+Critic 的 MSE 损失。输入：online critic 的 Q 预测 `[B, K]`（K 个 ensemble head）和上面 `compute_q_chunk_td_target` 算出的 TD target `[B]`。对所有 head 求 MSE 均值。被 `_run_critic_update_step` 调用。
+
+### `compute_aloe_advantage_and_weight(q_data, q_policy, beta, epsilon_clip)`
+
+ALOE 的优势权重计算，对应论文公式：
+
+```
+A = Q_pess(s, a_data) - V_pi(s)
+V_pi(s) = E_{a'~pi}[Q_pess(s, a')]
+w = exp(clip(A / beta, -epsilon_clip, epsilon_clip))
+```
+
+`q_data` 是 replay buffer 中存的动作对应的 Q 值，`q_policy` 是当前 policy 采样的动作对应的 Q 值（用于估计 V_pi）。返回 `(weights, advantages)`，shape 均为 `[B]`。被 `_run_actor_update_step` 调用。
+
+### `compute_aloe_actor_loss(flow_losses, weights)`
+
+加权 flow-matching actor 损失。`flow_losses` 是模型前向返回的逐样本 flow MSE `[B, ...]`，乘以 `weights` 后取均值。flow-matching 的连续动作 log-prob 难以直接计算，ALOE 用这个加权 MSE 作为代理目标。被 `_run_actor_update_step` 调用。

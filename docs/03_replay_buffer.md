@@ -65,6 +65,8 @@ def filter_by_success_ratio(self, target_success_ratio: float, rng=None) -> None
 
 **只操作内存索引，不修改磁盘文件。**
 
+> **Libero reward 约定**：libero 使用稀疏奖励，任务成功时 reward=0，失败时 reward 为负数（如 -1）。因此 `(rewards == 0).any()` 等价于"该轨迹中有成功时刻"。这个判断逻辑是 libero 特化的，不适用于其他 reward 编码方式。
+
 ---
 
 ## 未改动部分
