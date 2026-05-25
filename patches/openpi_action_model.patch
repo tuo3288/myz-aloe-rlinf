@@ -1,0 +1,42 @@
+diff --git a/rlinf/models/embodiment/openpi/openpi_action_model.py b/rlinf/models/embodiment/openpi/openpi_action_model.py
+index b247398..92ed4a2 100644
+--- a/rlinf/models/embodiment/openpi/openpi_action_model.py
++++ b/rlinf/models/embodiment/openpi/openpi_action_model.py
+@@ -623,10 +623,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
+         ]
+ 
+         bsize = action.shape[0]
+-        eta = torch.rand((bsize,), device=device, dtype=action.dtype)
++        # Sample time in [0,1] using the same convention as SFT (pi0_pytorch.forward):
++        #   t=0 → clean action,  t=1 → pure noise
++        #   x_t = t * noise + (1 - t) * action
++        # Previous code used the opposite convention (eta=1 → clean), which caused
++        # the timestep embedding fed to the model to be inverted relative to SFT
++        # training, producing completely wrong gradient directions.
++        t = torch.rand((bsize,), device=device, dtype=action.dtype)
+         epsilon = torch.randn_like(action)
+-        eta_expanded = eta[:, None, None]
+-        noisy_action = eta_expanded * action + (1.0 - eta_expanded) * epsilon
++        t_expanded = t[:, None, None]
++        noisy_action = t_expanded * epsilon + (1.0 - t_expanded) * action
+ 
+         _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+             images, img_masks, lang_tokens, lang_masks
+@@ -634,7 +640,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
+         v_theta, _ = self.get_velocity(
+             state,
+             noisy_action,
+-            eta,
++            t,
+             prefix_pad_masks,
+             past_key_values,
+         )
+@@ -648,7 +654,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
+         return {
+             "flow_losses": flow_losses,
+             "v_theta": v_theta,
+-            "timesteps": eta,
++            "timesteps": t,
+         }
+ 
+     @torch.no_grad()

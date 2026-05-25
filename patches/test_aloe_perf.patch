@@ -1,0 +1,247 @@
+diff --git a/tests/unit_tests/test_aloe_perf.py b/tests/unit_tests/test_aloe_perf.py
+new file mode 100644
+index 0000000..4309597
+--- /dev/null
++++ b/tests/unit_tests/test_aloe_perf.py
+@@ -0,0 +1,241 @@
++"""Numerical equivalence tests for ALOE performance optimizations.
++
++Covers:
++  T1 — TD target vectorization: new cumprod impl matches original for loop.
++  T2 — _extract_critic_context_pair: fused forward splits correctly (mock model).
++  T3 — _extract_critic_context_pair: falls back when tensor shapes differ.
++"""
++
++import math
++import unittest.mock as mock
++
++import torch
++import pytest
++
++from rlinf.algorithms.aloe_losses import compute_q_chunk_td_target
++
++
++# ---------------------------------------------------------------------------
++# Reference (loop) implementation of the multi-step TD target.
++# Kept here to compare against the vectorized version without touching prod.
++# ---------------------------------------------------------------------------
++
++def _td_target_loop_reference(q_next, rewards, dones, gamma, chunk_len):
++    """Exact copy of the original for-loop logic, used as ground truth."""
++    if q_next.dim() == 3:
++        q_min_next = q_next.min(dim=-1).values.mean(dim=1, keepdim=True)
++    else:
++        q_min_next = q_next.min(dim=-1, keepdim=True).values
++
++    rewards_h = rewards.float()
++    dones_h = dones.float()
++    B, H = rewards_h.shape
++
++    alive = torch.ones(B, 1, device=rewards_h.device)
++    cum_rewards = torch.zeros(B, 1, device=rewards_h.device)
++    for k in range(H):
++        cum_rewards = cum_rewards + alive * (gamma**k) * rewards_h[:, k : k + 1]
++        alive = alive * (1.0 - dones_h[:, k : k + 1])
++
++    td_target = cum_rewards + (gamma**H) * alive * q_min_next
++    return td_target.squeeze(-1)
++
++
++# ---------------------------------------------------------------------------
++# T1: TD target numerical equivalence
++# ---------------------------------------------------------------------------
++
++def _make_td_batch(B, H, device="cpu", seed=0):
++    g = torch.Generator(device=device)
++    g.manual_seed(seed)
++    rewards = torch.rand(B, H, generator=g, device=device)
++    # ~10% done rate; ensure some mid-chunk terminations
++    dones = (torch.rand(B, H, generator=g, device=device) < 0.1).float()
++    q_next = torch.randn(B, 4, generator=g, device=device)  # K=4 ensemble
++    return rewards, dones, q_next
++
++
++@pytest.mark.parametrize("gamma", [0.99, 1.0, 0.95])
++@pytest.mark.parametrize("B,H", [(32, 10), (1, 10), (64, 1)])
++def test_td_target_vectorized_matches_loop(B, H, gamma):
++    rewards, dones, q_next = _make_td_batch(B, H)
++    chunk_len = H
++
++    ref = _td_target_loop_reference(q_next, rewards, dones, gamma, chunk_len)
++    new = compute_q_chunk_td_target(q_next, rewards, dones, gamma, chunk_len)
++
++    max_diff = (ref - new).abs().max().item()
++    assert max_diff < 1e-5, f"max diff {max_diff:.2e} exceeds 1e-5 (B={B} H={H} gamma={gamma})"
++
++
++def test_td_target_all_done_zero():
++    """No termination: alive stays 1 throughout, full bootstrap."""
++    B, H = 8, 10
++    rewards = torch.ones(B, H)
++    dones = torch.zeros(B, H)
++    q_next = torch.ones(B, 2)
++    gamma = 0.99
++
++    ref = _td_target_loop_reference(q_next, rewards, dones, gamma, H)
++    new = compute_q_chunk_td_target(q_next, rewards, dones, gamma, H)
++    torch.testing.assert_close(ref, new, atol=1e-5, rtol=0)
++
++
++def test_td_target_done_at_step_zero():
++    """Episode ends at first step: only r_0 contributes, no bootstrap."""
++    B, H = 4, 10
++    rewards = torch.ones(B, H)
++    dones = torch.zeros(B, H)
++    dones[:, 0] = 1.0  # terminate immediately
++    q_next = torch.ones(B, 2) * 100.0  # should be masked out
++    gamma = 0.99
++
++    ref = _td_target_loop_reference(q_next, rewards, dones, gamma, H)
++    new = compute_q_chunk_td_target(q_next, rewards, dones, gamma, H)
++    torch.testing.assert_close(ref, new, atol=1e-5, rtol=0)
++    # All targets should equal r_0 = 1.0 (bootstrap masked)
++    torch.testing.assert_close(new, torch.ones(B), atol=1e-5, rtol=0)
++
++
++def test_td_target_single_step_branch_unchanged():
++    """chunk_len=1 uses a different code path; verify it is not affected."""
++    B = 16
++    rewards = torch.randn(B)
++    dones = (torch.rand(B) < 0.2).float()
++    q_next = torch.randn(B, 3)
++    gamma = 0.99
++
++    # chunk_len=1 should be stable regardless of our multi-step changes
++    out = compute_q_chunk_td_target(q_next, rewards, dones, gamma, chunk_len=1)
++    assert out.shape == (B,)
++    assert torch.isfinite(out).all()
++
++
++# ---------------------------------------------------------------------------
++# T2: _extract_critic_context_pair fuses two batches into one model call
++# ---------------------------------------------------------------------------
++
++def _make_forward_inputs(B, prompt_len=32, device="cpu", seed=0):
++    g = torch.Generator(device=device)
++    g.manual_seed(seed)
++    return {
++        "tokenized_prompt": torch.randint(0, 1000, (B, prompt_len), generator=g),
++        "tokenized_prompt_mask": torch.ones(B, prompt_len, dtype=torch.bool),
++        "observation/image": torch.rand(B, 3, 224, 224, generator=g),
++    }
++
++
++def _make_fake_context(B, context_dim=64, num_images=2, device="cpu", seed=0):
++    """Fake context dict matching extract_aloe_critic_context output shape."""
++    g = torch.Generator(device=device)
++    g.manual_seed(seed)
++    return {
++        "visual_tokens": torch.rand(B, num_images, context_dim, generator=g),
++        "language_tokens": torch.rand(B, 1, context_dim, generator=g),
++        "context_mask": torch.ones(B, num_images + 1, dtype=torch.bool),
++    }
++
++
++def _build_fake_worker(use_pi05_context=True):
++    """Build a minimal worker stub for testing _extract_critic_context_pair."""
++    import rlinf.workers.actor.fsdp_aloe_actor_worker as mod
++
++    call_log = []
++
++    # MagicMock.side_effect is invoked on direct calls: mock(a=b) → side_effect(a=b).
++    def _fake_forward(forward_type, forward_inputs):
++        B = next(iter(forward_inputs.values())).shape[0]
++        call_log.append(B)
++        return _make_fake_context(B, seed=42)
++
++    fake_model = mock.MagicMock(side_effect=_fake_forward)
++    fake_model.training = True
++
++    # Simple namespace object — no class needed.
++    class _W:
++        pass
++    worker = _W()
++    worker._critic_use_pi05_context = use_pi05_context
++    worker.device = torch.device("cpu")
++    worker.model = fake_model
++    worker._call_log = call_log
++
++    # Wire _extract_critic_context so the fall-back path inside pair() works.
++    worker._extract_critic_context = lambda fi: mod.ALOEFSDPActorWorker._extract_critic_context(worker, fi)
++
++    return worker, mod
++
++
++def test_extract_critic_context_pair_single_model_call():
++    """pair() should call model exactly once with batch=2B."""
++    import rlinf.workers.actor.fsdp_aloe_actor_worker as mod
++    from rlinf.models.embodiment.base_policy import ForwardType
++
++    B = 8
++    fi_a = _make_forward_inputs(B, seed=1)
++    fi_b = _make_forward_inputs(B, seed=2)
++
++    worker, mod = _build_fake_worker(use_pi05_context=True)
++
++    with mock.patch.object(mod, "put_tensor_device", side_effect=lambda x, _: x):
++        ctx_a, ctx_b = mod.ALOEFSDPActorWorker._extract_critic_context_pair(
++            worker, fi_a, fi_b
++        )
++
++    assert len(worker._call_log) == 1, (
++        f"Expected 1 model call, got {len(worker._call_log)}"
++    )
++    assert worker._call_log[0] == 2 * B, (
++        f"Expected batch=2B={2*B}, got {worker._call_log[0]}"
++    )
++    for k in ctx_a:
++        assert ctx_a[k].shape[0] == B
++        assert ctx_b[k].shape[0] == B
++
++
++def test_extract_critic_context_pair_disabled_returns_empty():
++    """When _critic_use_pi05_context=False, pair() returns two empty dicts."""
++    import rlinf.workers.actor.fsdp_aloe_actor_worker as mod
++
++    B = 4
++    fi_a = _make_forward_inputs(B, seed=1)
++    fi_b = _make_forward_inputs(B, seed=2)
++    worker, _ = _build_fake_worker(use_pi05_context=False)
++
++    with mock.patch.object(mod, "put_tensor_device", side_effect=lambda x, _: x):
++        ctx_a, ctx_b = mod.ALOEFSDPActorWorker._extract_critic_context_pair(
++            worker, fi_a, fi_b
++        )
++
++    assert ctx_a == {} and ctx_b == {}
++    assert len(worker._call_log) == 0
++
++
++# ---------------------------------------------------------------------------
++# T3: shape mismatch triggers fall-back (two separate calls)
++# ---------------------------------------------------------------------------
++
++def test_extract_critic_context_pair_fallback_on_shape_mismatch():
++    """Different tokenized_prompt lengths → fall back to 2 separate calls."""
++    import rlinf.workers.actor.fsdp_aloe_actor_worker as mod
++
++    B = 4
++    fi_a = _make_forward_inputs(B, prompt_len=32, seed=1)
++    fi_b = _make_forward_inputs(B, prompt_len=48, seed=2)  # different length
++
++    worker, _ = _build_fake_worker(use_pi05_context=True)
++
++    with mock.patch.object(mod, "put_tensor_device", side_effect=lambda x, _: x):
++        ctx_a, ctx_b = mod.ALOEFSDPActorWorker._extract_critic_context_pair(
++            worker, fi_a, fi_b
++        )
++
++    # Should have made 2 model calls (fall-back path), each with batch=B
++    assert len(worker._call_log) == 2, (
++        f"Expected 2 model calls (fall-back), got {len(worker._call_log)}"
++    )
++    assert worker._call_log[0] == B
++    assert worker._call_log[1] == B
++    for k in ctx_a:
++        assert ctx_a[k].shape[0] == B
++        assert ctx_b[k].shape[0] == B

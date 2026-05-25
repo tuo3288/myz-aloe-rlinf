@@ -1,0 +1,466 @@
+diff --git a/examples/aloe/collect.sh b/examples/aloe/collect.sh
+new file mode 100644
+index 0000000..bf04d6b
+--- /dev/null
++++ b/examples/aloe/collect.sh
+@@ -0,0 +1,96 @@
++#!/usr/bin/env bash
++#
++# collect.sh — paper Algorithm L2-L3: rollout π_θ and store transitions into D.
++#
++# Underlying:  examples/embodiment/train_embodied_agent.py
++# Mode:        rollout-only (algorithm.aloe.N_Q=0, N_pi=0 → run_training is no-op)
++# Replay:      in-memory accumulation; save_checkpoint writes the full buffer
++#              when Patch A's _replay_dirty was set by recv_rollout_trajectories.
++#
++# CLI
++#   --resume-dir DIR              previous iter actor ckpt (or first SFT collect ckpt)  (required)
++#   --bootstrap-replay-dir DIR    optional bootstrap replay (iter 1 only)
++#   --target-episodes N           collect ~N episodes total                              (default 64)
++#   --target-success N            TODO; warn + fall back to --target-episodes
++#   --success-fail-ratio R        TODO; warn + no-op
++#   --suite NAME                  LIBERO subset (default libero_goal)
++#   --log-dir DIR                 per-run dir; entry creates run.log + ckpts under it    (required)
++#   --exp-name NAME               default collect_<seed>_<ts>
++#   --seed N                      default 42
++#   --                            everything after is hydra passthrough
++#
++# Env: requires ALOE_PI05_MODEL_PATH; honours ALOE_GPUS, ALOE_BETA.
++
++source "$(dirname "$0")/lib/common.sh"
++
++RESUME_DIR=""
++BOOTSTRAP_REPLAY_DIR=""
++TARGET_EPISODES=64
++TARGET_SUCCESS=""
++SUCCESS_FAIL_RATIO=""
++SUITE="$aloe_default_suite"
++LOG_DIR=""
++EXP_NAME=""
++SEED=$aloe_default_seed
++HYDRA_PASSTHROUGH=()
++
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --resume-dir) RESUME_DIR="$2"; shift 2 ;;
++        --bootstrap-replay-dir) BOOTSTRAP_REPLAY_DIR="$2"; shift 2 ;;
++        --target-episodes) TARGET_EPISODES="$2"; shift 2 ;;
++        --target-success) TARGET_SUCCESS="$2"; shift 2 ;;
++        --success-fail-ratio) SUCCESS_FAIL_RATIO="$2"; shift 2 ;;
++        --suite) SUITE="$2"; shift 2 ;;
++        --log-dir) LOG_DIR="$2"; shift 2 ;;
++        --exp-name) EXP_NAME="$2"; shift 2 ;;
++        --seed) SEED="$2"; shift 2 ;;
++        --) shift; HYDRA_PASSTHROUGH=("$@"); break ;;
++        -h|--help) sed -n '3,24p' "$0"; exit 0 ;;
++        *) aloe_die "unknown arg: $1" ;;
++    esac
++done
++
++[[ -n "$RESUME_DIR" ]] || aloe_die "--resume-dir is required"
++[[ -n "$LOG_DIR"     ]] || aloe_die "--log-dir is required"
++aloe_assert_ckpt "$RESUME_DIR"
++[[ -z "$EXP_NAME" ]] && EXP_NAME=$(aloe_default_exp_name "collect_seed${SEED}")
++
++if [[ -n "$TARGET_SUCCESS" || -n "$SUCCESS_FAIL_RATIO" ]]; then
++    aloe_warn "--target-success / --success-fail-ratio require python-side replay filtering (TODO);"
++    aloe_warn "this run will use --target-episodes=$TARGET_EPISODES instead."
++fi
++
++RESUME_STEP=$(aloe_parse_global_step "$RESUME_DIR")
++TOTAL_ENVS=$aloe_default_total_train_envs   # yaml default; never overridden
++DELTA_STEPS=$(( (TARGET_EPISODES + TOTAL_ENVS - 1) / TOTAL_ENVS ))
++ABS_MAX=$(( RESUME_STEP + DELTA_STEPS ))
++
++aloe_init_log_dir "$LOG_DIR"
++aloe_log "collect: suite=${SUITE} resume@global_step_${RESUME_STEP} +${DELTA_STEPS} → global_step_${ABS_MAX}"
++aloe_log "         target_episodes=${TARGET_EPISODES}  total_envs=${TOTAL_ENVS}"
++
++PRELOAD_ARGS=()
++if [[ -n "$BOOTSTRAP_REPLAY_DIR" ]]; then
++    [[ -d "$BOOTSTRAP_REPLAY_DIR" ]] || aloe_die "bootstrap dir not found: $BOOTSTRAP_REPLAY_DIR"
++    aloe_log "         bootstrap replay = $BOOTSTRAP_REPLAY_DIR"
++    PRELOAD_ARGS=("algorithm.aloe.replay_preload_path=${BOOTSTRAP_REPLAY_DIR}")
++fi
++
++mapfile -t BASE_OVERRIDES < <(aloe_base_overrides "$LOG_DIR" "$EXP_NAME" "$SUITE")
++
++aloe_run train_embodied_agent.py "$LOG_DIR" \
++    "algorithm.aloe.N_Q=0" \
++    "algorithm.aloe.N_pi=0" \
++    "algorithm.replay_buffer.auto_save=false" \
++    "rollout.collect_transitions=true" \
++    "runner.max_steps=${ABS_MAX}" \
++    "runner.max_epochs=${ABS_MAX}" \
++    "runner.save_interval=${ABS_MAX}" \
++    "runner.val_check_interval=-1" \
++    "runner.only_eval=False" \
++    "runner.resume_dir=${RESUME_DIR}" \
++    "actor.seed=${SEED}" \
++    "${BASE_OVERRIDES[@]}" \
++    "${PRELOAD_ARGS[@]}" \
++    "${HYDRA_PASSTHROUGH[@]}"
+diff --git a/examples/aloe/outer_loop.sh b/examples/aloe/outer_loop.sh
+new file mode 100644
+index 0000000..98fae84
+--- /dev/null
++++ b/examples/aloe/outer_loop.sh
+@@ -0,0 +1,166 @@
++#!/usr/bin/env bash
++#
++# outer_loop.sh — paper Algorithm L1-L17: T iterations of (collect → critic → actor → eval).
++#
++# For each iter k = 1..T:
++#   1. collect.sh         (paper L2-L3)
++#   2. train_critic.sh    (paper L4-L9)
++#   3. train_actor.sh     (paper L10-L15)
++#   4. eval               (paper "return")
++#
++# Replay flows through the resume_dir chain (no on-disk merge).
++#
++# CLI
++#   --root DIR                          required; <root>/iter_N/{collect,critic,actor,eval}/
++#   --initial-actor-ckpt PATH           required; first iter's resume_dir (RLinf-format ckpt)
++#   --bootstrap-replay-dir DIR          optional; iter 1 only
++#   --suite NAME                        default libero_goal
++#   --n-iter N                          default 3
++#   --collect-episodes-per-iter N       default 64
++#   --critic-steps-per-iter N           default 10000
++#   --actor-steps-per-iter  N           default 5000
++#   --critic-save-interval K            default = critic-steps
++#   --actor-save-interval  K            default = actor-steps
++#   --cosine-mode {global,per_iter}     default global
++#   --eval-episodes N                   default 50
++#   --seed N                            default 42
++#
++# Env: requires ALOE_PI05_MODEL_PATH; honours ALOE_GPUS, ALOE_BETA.
++
++source "$(dirname "$0")/lib/common.sh"
++
++ROOT=""
++INITIAL_ACTOR_CKPT=""
++BOOTSTRAP_REPLAY_DIR=""
++SUITE="$aloe_default_suite"
++N_ITER=3
++COLLECT_EP=64
++CRITIC_STEPS=10000
++ACTOR_STEPS=5000
++CRITIC_SAVE_INTERVAL=""
++ACTOR_SAVE_INTERVAL=""
++COSINE_MODE="global"
++EVAL_EPISODES=50
++SEED=$aloe_default_seed
++
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --root) ROOT="$2"; shift 2 ;;
++        --initial-actor-ckpt) INITIAL_ACTOR_CKPT="$2"; shift 2 ;;
++        --bootstrap-replay-dir) BOOTSTRAP_REPLAY_DIR="$2"; shift 2 ;;
++        --suite) SUITE="$2"; shift 2 ;;
++        --n-iter) N_ITER="$2"; shift 2 ;;
++        --collect-episodes-per-iter) COLLECT_EP="$2"; shift 2 ;;
++        --critic-steps-per-iter) CRITIC_STEPS="$2"; shift 2 ;;
++        --actor-steps-per-iter) ACTOR_STEPS="$2"; shift 2 ;;
++        --critic-save-interval) CRITIC_SAVE_INTERVAL="$2"; shift 2 ;;
++        --actor-save-interval) ACTOR_SAVE_INTERVAL="$2"; shift 2 ;;
++        --cosine-mode) COSINE_MODE="$2"; shift 2 ;;
++        --eval-episodes) EVAL_EPISODES="$2"; shift 2 ;;
++        --seed) SEED="$2"; shift 2 ;;
++        -h|--help) sed -n '3,30p' "$0"; exit 0 ;;
++        *) aloe_die "unknown arg: $1" ;;
++    esac
++done
++
++[[ -n "$ROOT" ]] || aloe_die "--root is required"
++[[ -n "$INITIAL_ACTOR_CKPT" ]] || aloe_die "--initial-actor-ckpt is required"
++aloe_assert_ckpt "$INITIAL_ACTOR_CKPT"
++[[ "$COSINE_MODE" == "global" || "$COSINE_MODE" == "per_iter" ]] \
++    || aloe_die "--cosine-mode must be one of {global, per_iter}"
++
++[[ -z "$CRITIC_SAVE_INTERVAL" ]] && CRITIC_SAVE_INTERVAL="$CRITIC_STEPS"
++[[ -z "$ACTOR_SAVE_INTERVAL"  ]] && ACTOR_SAVE_INTERVAL="$ACTOR_STEPS"
++
++mkdir -p "$ROOT"
++TOTAL_CRITIC=$(( N_ITER * CRITIC_STEPS ))
++
++aloe_log "=========================================="
++aloe_log "ALOE outer-loop  suite=$SUITE"
++aloe_log "  root              = $ROOT"
++aloe_log "  initial actor     = $INITIAL_ACTOR_CKPT"
++aloe_log "  bootstrap replay  = ${BOOTSTRAP_REPLAY_DIR:-<none>}"
++aloe_log "  n_iter            = $N_ITER"
++aloe_log "  collect ep/iter   = $COLLECT_EP"
++aloe_log "  critic steps/iter = $CRITIC_STEPS  (save_interval=${CRITIC_SAVE_INTERVAL})"
++aloe_log "  actor  steps/iter = $ACTOR_STEPS   (save_interval=${ACTOR_SAVE_INTERVAL})"
++aloe_log "  cosine mode       = $COSINE_MODE   (TOTAL_CRITIC=${TOTAL_CRITIC})"
++aloe_log "  eval episodes     = $EVAL_EPISODES"
++aloe_log "  seed=$SEED  ALOE_GPUS=${ALOE_GPUS:-0,1}"
++aloe_log "=========================================="
++
++ACTOR_CKPT="$INITIAL_ACTOR_CKPT"
++DIR=$(dirname "$0")
++
++for ITER in $(seq 1 "$N_ITER"); do
++    ITER_ROOT="$ROOT/iter_${ITER}"
++    aloe_log "==== iter ${ITER} / ${N_ITER}  (root=${ITER_ROOT}) ===="
++
++    # ------------- 1) Collect ------------- #
++    BOOTSTRAP_FLAG=()
++    if [[ "$ITER" == "1" && -n "$BOOTSTRAP_REPLAY_DIR" ]]; then
++        BOOTSTRAP_FLAG=(--bootstrap-replay-dir "$BOOTSTRAP_REPLAY_DIR")
++    fi
++    bash "$DIR/collect.sh" \
++        --resume-dir "$ACTOR_CKPT" \
++        "${BOOTSTRAP_FLAG[@]}" \
++        --target-episodes "$COLLECT_EP" \
++        --suite "$SUITE" \
++        --log-dir "$ITER_ROOT/collect" \
++        --exp-name "collect_iter${ITER}" \
++        --seed $((SEED + ITER))
++
++    COLLECT_CKPT=$(aloe_latest_ckpt "$ITER_ROOT/collect/collect_iter${ITER}/checkpoints")
++    [[ -n "$COLLECT_CKPT" ]] || aloe_die "iter${ITER} collect produced no ckpt"
++    aloe_log "iter${ITER} collect ckpt: $COLLECT_CKPT"
++
++    # ------------- 2) Critic block ------------- #
++    COSINE_ARGS=()
++    if [[ "$COSINE_MODE" == "per_iter" ]]; then
++        COSINE_ARGS=(--reset-cosine)
++    else
++        COSINE_ARGS=(--global-cosine-total "$TOTAL_CRITIC")
++    fi
++    bash "$DIR/train_critic.sh" \
++        --resume-dir "$COLLECT_CKPT" \
++        --max-steps "$CRITIC_STEPS" \
++        --save-interval "$CRITIC_SAVE_INTERVAL" \
++        "${COSINE_ARGS[@]}" \
++        --suite "$SUITE" \
++        --log-dir "$ITER_ROOT/critic" \
++        --exp-name "critic_iter${ITER}" \
++        --seed "$SEED"
++
++    CRITIC_CKPT=$(aloe_latest_ckpt "$ITER_ROOT/critic/critic_iter${ITER}/checkpoints")
++    [[ -n "$CRITIC_CKPT" ]] || aloe_die "iter${ITER} critic produced no ckpt"
++    aloe_log "iter${ITER} critic ckpt: $CRITIC_CKPT"
++
++    # ------------- 3) Actor block ------------- #
++    bash "$DIR/train_actor.sh" \
++        --resume-dir "$CRITIC_CKPT" \
++        --max-steps "$ACTOR_STEPS" \
++        --save-interval "$ACTOR_SAVE_INTERVAL" \
++        --suite "$SUITE" \
++        --log-dir "$ITER_ROOT/actor" \
++        --exp-name "actor_iter${ITER}" \
++        --seed "$SEED"
++
++    ACTOR_CKPT=$(aloe_latest_ckpt "$ITER_ROOT/actor/actor_iter${ITER}/checkpoints")
++    [[ -n "$ACTOR_CKPT" ]] || aloe_die "iter${ITER} actor produced no ckpt"
++    aloe_log "iter${ITER} actor ckpt: $ACTOR_CKPT"
++
++    # ------------- 4) Eval ------------- #
++    EVAL_LOG_DIR="$ITER_ROOT/eval"
++    EVAL_EXP="eval_iter${ITER}"
++    aloe_init_log_dir "$EVAL_LOG_DIR"
++    aloe_log "iter${ITER} eval: ckpt=$ACTOR_CKPT episodes=$EVAL_EPISODES"
++
++    mapfile -t EVAL_OVERRIDES < <(aloe_base_overrides "$EVAL_LOG_DIR" "$EVAL_EXP" "$SUITE")
++    aloe_run eval_embodied_agent.py "$EVAL_LOG_DIR" \
++        "runner.only_eval=True" \
++        "runner.resume_dir=${ACTOR_CKPT}" \
++        "+runner.eval_episodes=${EVAL_EPISODES}" \
++        "${EVAL_OVERRIDES[@]}"
++done
++
++aloe_log "==== outer-loop complete: final actor ckpt = $ACTOR_CKPT ===="
+diff --git a/examples/aloe/train_actor.sh b/examples/aloe/train_actor.sh
+new file mode 100644
+index 0000000..12b3d37
+--- /dev/null
++++ b/examples/aloe/train_actor.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++#
++# train_actor.sh — paper Algorithm L10-L15: N_π AWR-weighted flow updates.
++#
++# Underlying:    examples/embodiment/train_offline_rl.py
++# Mode:          actor-only (algorithm.aloe.N_Q=0, N_pi=1; one outer step ≡
++#                one actor gradient step).
++#
++# Note: actor optimizer has no LR scheduler in current code. --reset-cosine /
++#       --global-cosine-total are silently ignored (warned).
++#
++# CLI
++#   --resume-dir DIR              previous phase ckpt                              (required)
++#   --max-steps N                 DELTA: actor grad steps for THIS call            (required)
++#   --save-interval K             default = DELTA
++#   --suite NAME                  default libero_goal
++#   --log-dir DIR                 per-run dir                                       (required)
++#   --exp-name NAME
++#   --seed N                      default 42
++#   --                            hydra passthrough
++#
++# Env: requires ALOE_PI05_MODEL_PATH; honours ALOE_GPUS, ALOE_BETA.
++
++source "$(dirname "$0")/lib/common.sh"
++
++RESUME_DIR=""
++DELTA=""
++SAVE_INTERVAL=""
++SUITE="$aloe_default_suite"
++LOG_DIR=""
++EXP_NAME=""
++SEED=$aloe_default_seed
++HYDRA_PASSTHROUGH=()
++
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --resume-dir) RESUME_DIR="$2"; shift 2 ;;
++        --max-steps) DELTA="$2"; shift 2 ;;
++        --save-interval) SAVE_INTERVAL="$2"; shift 2 ;;
++        --suite) SUITE="$2"; shift 2 ;;
++        --log-dir) LOG_DIR="$2"; shift 2 ;;
++        --exp-name) EXP_NAME="$2"; shift 2 ;;
++        --seed) SEED="$2"; shift 2 ;;
++        --reset-cosine|--global-cosine-total)
++            aloe_warn "actor optim has no LR scheduler; ignoring $1"
++            [[ "$1" == "--global-cosine-total" ]] && shift
++            shift ;;
++        --) shift; HYDRA_PASSTHROUGH=("$@"); break ;;
++        -h|--help) sed -n '3,22p' "$0"; exit 0 ;;
++        *) aloe_die "unknown arg: $1" ;;
++    esac
++done
++
++[[ -n "$RESUME_DIR" ]] || aloe_die "--resume-dir is required"
++[[ -n "$DELTA"      ]] || aloe_die "--max-steps is required"
++[[ -n "$LOG_DIR"    ]] || aloe_die "--log-dir is required"
++aloe_assert_ckpt "$RESUME_DIR"
++[[ -z "$EXP_NAME" ]] && EXP_NAME=$(aloe_default_exp_name "actor_seed${SEED}")
++[[ -z "$SAVE_INTERVAL" ]] && SAVE_INTERVAL="$DELTA"
++
++RESUME_STEP=$(aloe_parse_global_step "$RESUME_DIR")
++ABS_MAX=$(( RESUME_STEP + DELTA ))
++
++aloe_init_log_dir "$LOG_DIR"
++aloe_log "actor:  suite=${SUITE} resume@global_step_${RESUME_STEP} +${DELTA} → global_step_${ABS_MAX}"
++aloe_log "        save_interval=${SAVE_INTERVAL}"
++
++mapfile -t BASE_OVERRIDES < <(aloe_base_overrides "$LOG_DIR" "$EXP_NAME" "$SUITE")
++
++aloe_run train_offline_rl.py "$LOG_DIR" \
++    "algorithm.aloe.N_Q=0" \
++    "algorithm.aloe.N_pi=1" \
++    "runner.max_steps=${ABS_MAX}" \
++    "runner.max_epochs=${ABS_MAX}" \
++    "runner.save_interval=${SAVE_INTERVAL}" \
++    "runner.val_check_interval=-1" \
++    "runner.only_eval=False" \
++    "runner.resume_dir=${RESUME_DIR}" \
++    "actor.seed=${SEED}" \
++    "${BASE_OVERRIDES[@]}" \
++    "${HYDRA_PASSTHROUGH[@]}"
+diff --git a/examples/aloe/train_critic.sh b/examples/aloe/train_critic.sh
+new file mode 100644
+index 0000000..1684da0
+--- /dev/null
++++ b/examples/aloe/train_critic.sh
+@@ -0,0 +1,99 @@
++#!/usr/bin/env bash
++#
++# train_critic.sh — paper Algorithm L4-L9: N_Q critic gradient steps + Polyak.
++#
++# Underlying:    examples/embodiment/train_offline_rl.py
++# Mode:          critic-only (algorithm.aloe.N_Q=1, N_pi=0; one outer step ≡
++#                one critic gradient step per _design.md §1).
++#
++# Cosine LR:
++#   default     — global cosine over --global-cosine-total steps (state resumed)
++#   --reset-cosine — sets actor.critic_optim.reset_scheduler_on_load=True;
++#                  scheduler reconstructed each call with last_epoch=0 (Patch B).
++#
++# CLI
++#   --resume-dir DIR              previous phase ckpt                              (required)
++#   --max-steps N                 DELTA: critic grad steps for THIS call           (required)
++#   --save-interval K             default = DELTA  (single end-of-call save)
++#   --reset-cosine                per-call cosine restart
++#   --global-cosine-total N       default = DELTA when --reset-cosine is unset
++#   --suite NAME                  default libero_goal
++#   --log-dir DIR                 per-run dir                                       (required)
++#   --exp-name NAME
++#   --seed N                      default 42
++#   --                            hydra passthrough
++#
++# Env: requires ALOE_PI05_MODEL_PATH; honours ALOE_GPUS, ALOE_BETA.
++
++source "$(dirname "$0")/lib/common.sh"
++
++RESUME_DIR=""
++DELTA=""
++SAVE_INTERVAL=""
++RESET_COSINE=0
++GLOBAL_COSINE_TOTAL=""
++SUITE="$aloe_default_suite"
++LOG_DIR=""
++EXP_NAME=""
++SEED=$aloe_default_seed
++HYDRA_PASSTHROUGH=()
++
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --resume-dir) RESUME_DIR="$2"; shift 2 ;;
++        --max-steps) DELTA="$2"; shift 2 ;;
++        --save-interval) SAVE_INTERVAL="$2"; shift 2 ;;
++        --reset-cosine) RESET_COSINE=1; shift ;;
++        --global-cosine-total) GLOBAL_COSINE_TOTAL="$2"; shift 2 ;;
++        --suite) SUITE="$2"; shift 2 ;;
++        --log-dir) LOG_DIR="$2"; shift 2 ;;
++        --exp-name) EXP_NAME="$2"; shift 2 ;;
++        --seed) SEED="$2"; shift 2 ;;
++        --) shift; HYDRA_PASSTHROUGH=("$@"); break ;;
++        -h|--help) sed -n '3,28p' "$0"; exit 0 ;;
++        *) aloe_die "unknown arg: $1" ;;
++    esac
++done
++
++[[ -n "$RESUME_DIR" ]] || aloe_die "--resume-dir is required"
++[[ -n "$DELTA"      ]] || aloe_die "--max-steps is required"
++[[ -n "$LOG_DIR"    ]] || aloe_die "--log-dir is required"
++aloe_assert_ckpt "$RESUME_DIR"
++[[ -z "$EXP_NAME" ]] && EXP_NAME=$(aloe_default_exp_name "critic_seed${SEED}")
++[[ -z "$SAVE_INTERVAL" ]] && SAVE_INTERVAL="$DELTA"
++
++RESUME_STEP=$(aloe_parse_global_step "$RESUME_DIR")
++ABS_MAX=$(( RESUME_STEP + DELTA ))
++
++if [[ "$RESET_COSINE" == "1" ]]; then
++    COSINE_T="$DELTA"
++    COSINE_MODE_STR="per-call restart"
++    # `+key=` syntax adds the field; the yaml schema is strict-mode and
++    # `reset_scheduler_on_load` is not declared as a default field there.
++    COSINE_FLAG=("+actor.critic_optim.reset_scheduler_on_load=True")
++else
++    COSINE_T="${GLOBAL_COSINE_TOTAL:-$DELTA}"
++    COSINE_MODE_STR="global (resume scheduler state)"
++    COSINE_FLAG=("+actor.critic_optim.reset_scheduler_on_load=False")
++fi
++
++aloe_init_log_dir "$LOG_DIR"
++aloe_log "critic: suite=${SUITE} resume@global_step_${RESUME_STEP} +${DELTA} → global_step_${ABS_MAX}"
++aloe_log "        save_interval=${SAVE_INTERVAL}  cosine=${COSINE_MODE_STR}  T_max=${COSINE_T}"
++
++mapfile -t BASE_OVERRIDES < <(aloe_base_overrides "$LOG_DIR" "$EXP_NAME" "$SUITE")
++
++aloe_run train_offline_rl.py "$LOG_DIR" \
++    "algorithm.aloe.N_Q=1" \
++    "algorithm.aloe.N_pi=0" \
++    "runner.max_steps=${ABS_MAX}" \
++    "runner.max_epochs=${ABS_MAX}" \
++    "runner.save_interval=${SAVE_INTERVAL}" \
++    "runner.val_check_interval=-1" \
++    "runner.only_eval=False" \
++    "actor.critic_optim.num_training_steps=${COSINE_T}" \
++    "${COSINE_FLAG[@]}" \
++    "runner.resume_dir=${RESUME_DIR}" \
++    "actor.seed=${SEED}" \
++    "${BASE_OVERRIDES[@]}" \
++    "${HYDRA_PASSTHROUGH[@]}"

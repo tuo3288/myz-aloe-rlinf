@@ -1,0 +1,144 @@
+diff --git a/rlinf/data/replay_buffer.py b/rlinf/data/replay_buffer.py
+index 7fab360..15da7e1 100644
+--- a/rlinf/data/replay_buffer.py
++++ b/rlinf/data/replay_buffer.py
+@@ -438,6 +438,16 @@ class TrajectoryReplayBuffer:
+ 
+         return trajectory
+ 
++    def _load_and_flatten_traj(self, trajectory_id: int) -> dict:
++        """Load a trajectory from disk and return its flattened form.
++
++        Designed to be submitted to a ThreadPoolExecutor so multiple
++        cache-miss trajectories can be fetched from beegfs in parallel.
++        """
++        mwid = self._trajectory_index[trajectory_id]["model_weights_id"]
++        trajectory = self._load_trajectory(trajectory_id, mwid)
++        return self._flatten_trajectory(trajectory)
++
+     def add_trajectories(self, trajectories: list[Trajectory]):
+         """
+         Add trajectories to the buffer.
+@@ -681,17 +691,21 @@ class TrajectoryReplayBuffer:
+                     batch, cache_buffer, buffer_indices, batch_indices
+                 )
+ 
+-        # 2) Cache misses: load all, concat, then gather once.
++        # 2) Cache misses: load all in parallel, concat, then gather once.
+         miss_mask = ~cached_mask
+         if torch.any(miss_mask):
+             miss_traj_ids = torch.unique(traj_ids_tensor[miss_mask]).tolist()
+             miss_flats: list[dict] = []
+             traj_offsets: dict[int, int] = {}
++            # Submit all disk loads concurrently; collect in original order so
++            # traj_offsets accounting stays deterministic.
++            load_futures = {
++                tid: self._checkpoint_executor.submit(self._load_and_flatten_traj, tid)
++                for tid in miss_traj_ids
++            }
+             cursor = 0
+             for tid in miss_traj_ids:
+-                model_weights_id = self._trajectory_index[tid]["model_weights_id"]
+-                trajectory = self._load_trajectory(tid, model_weights_id)
+-                flat_trajectory = self._flatten_trajectory(trajectory)
++                flat_trajectory = load_futures[tid].result()
+                 miss_flats.append(flat_trajectory)
+                 traj_offsets[tid] = cursor
+                 cursor += self._trajectory_index[tid]["num_samples"]
+@@ -1083,17 +1097,26 @@ class TrajectoryReplayBuffer:
+         unique_traj_ids = list(dict.fromkeys(traj_ids_per_sample))  # preserve order
+ 
+         flat_trajs: dict[int, dict] = {}
++        cache = self._flat_trajectory_cache
++        # Populate hits from cache; collect miss IDs for parallel disk load.
++        miss_tids = []
+         for tid in unique_traj_ids:
+-            # Try cache first (same pattern as sample_chunks)
+-            cache = self._flat_trajectory_cache
+             flat = cache.get(tid) if cache is not None else None
+-            if flat is None:
+-                model_weights_id = self._trajectory_index[tid]["model_weights_id"]
+-                trajectory = self._load_trajectory(tid, model_weights_id)
+-                flat = self._flatten_trajectory(trajectory)
++            if flat is not None:
++                flat_trajs[tid] = flat
++            else:
++                miss_tids.append(tid)
++        # Load all cache misses concurrently via _checkpoint_executor.
++        if miss_tids:
++            load_futures = {
++                tid: self._checkpoint_executor.submit(self._load_and_flatten_traj, tid)
++                for tid in miss_tids
++            }
++            for tid in miss_tids:
++                flat = load_futures[tid].result()
++                flat_trajs[tid] = flat
+                 if cache is not None:
+                     cache.put(tid, flat)
+-            flat_trajs[tid] = flat
+ 
+         # ------------------------------------------------------------------ #
+         # 4. For each batch item extract chunk_len + 1 consecutive steps      #
+@@ -1479,6 +1502,62 @@ class TrajectoryReplayBuffer:
+                         flat_trajectory,
+                     )
+ 
++    def filter_by_success_ratio(self, target_success_ratio: float, rng=None) -> None:
++        """Drop failed trajectories until success/(success+fail) >= target_success_ratio.
++
++        Operates on the in-memory index only; no files are modified.
++        A trajectory is considered successful if any reward value equals 0.
++        """
++        import random as _random
++
++        success_ids, fail_ids = [], []
++        for tid in list(self._trajectory_id_list):
++            pt_path = self._get_trajectory_path(
++                tid,
++                self._trajectory_index[tid]["model_weights_id"],
++                base_dir=self._trajectory_file_path[tid],
++            )
++            traj = torch.load(pt_path, map_location="cpu", weights_only=False)
++            rewards = traj["rewards"]
++            if (rewards == 0).any():
++                success_ids.append(tid)
++            else:
++                fail_ids.append(tid)
++
++        n_success = len(success_ids)
++        if n_success == 0 or target_success_ratio <= 0:
++            return
++
++        # How many fail trajectories to keep
++        # n_success / (n_success + n_fail_keep) >= ratio  →  n_fail_keep <= n_success*(1-ratio)/ratio
++        n_fail_keep = int(n_success * (1.0 - target_success_ratio) / target_success_ratio)
++        n_fail_keep = max(0, min(n_fail_keep, len(fail_ids)))
++
++        rng_obj = rng or _random.Random(self.seed)
++        keep_fail = set(rng_obj.sample(fail_ids, n_fail_keep))
++        remove_ids = [tid for tid in fail_ids if tid not in keep_fail]
++
++        for tid in remove_ids:
++            self._trajectory_index.pop(tid, None)
++            self._trajectory_file_path.pop(tid, None)
++        self._trajectory_id_list = [
++            tid for tid in self._trajectory_id_list if tid not in set(remove_ids)
++        ]
++        self.size = len(self._trajectory_id_list)
++        self._total_samples = sum(
++            info.get("num_samples", 0) for info in self._trajectory_index.values()
++        )
++
++        actual_ratio = n_success / self.size if self.size > 0 else 0.0
++        import logging
++        logging.getLogger(__name__).info(
++            f"filter_by_success_ratio: kept {n_success} success + {n_fail_keep} fail "
++            f"({actual_ratio:.1%} success), removed {len(remove_ids)} fail trajectories"
++        )
++
++        if self._flat_trajectory_cache is not None:
++            self._flat_trajectory_cache.clear()
++
+     def clear_cache(self):
+         """Clear trajectory cache."""
+         self.close()

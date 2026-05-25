@@ -1,0 +1,43 @@
+diff --git a/rlinf/algorithms/aloe_losses.py b/rlinf/algorithms/aloe_losses.py
+index 956e346..9bdffad 100644
+--- a/rlinf/algorithms/aloe_losses.py
++++ b/rlinf/algorithms/aloe_losses.py
+@@ -68,19 +68,25 @@ def compute_q_chunk_td_target(
+         # Compute discounted return sum_{k=0}^{H-1} gamma^k * r_{t+k}
+         # with early-termination when episode ends inside the chunk.
+         B, H = rewards_h.shape
+-        discount = torch.tensor(
+-            [gamma**k for k in range(H)], dtype=torch.float32, device=rewards_h.device
+-        )  # [H]
+-
+-        # Mask rewards after the first done within the chunk
+-        # alive[k] = product_{j=0}^{k-1} (1 - done[j])
+-        alive = torch.ones(B, 1, device=rewards_h.device)
+-        cum_rewards = torch.zeros(B, 1, device=rewards_h.device)
+-        for k in range(H):
+-            cum_rewards = cum_rewards + alive * (gamma**k) * rewards_h[:, k : k + 1]
+-            alive = alive * (1.0 - dones_h[:, k : k + 1])
+-
+-        # alive after all H steps = (1 - done_{t+H-1}) indicator
++        survival = 1.0 - dones_h  # [B, H]
++
++        # alive_mask[:, k] = prod_{j<k}(1 - done[j])  (exclusive cumprod)
++        # Shift survival right by one (prepend ones, drop last col), then cumprod.
++        alive_mask = torch.cumprod(
++            torch.cat(
++                [torch.ones(B, 1, device=rewards_h.device, dtype=torch.float32),
++                 survival[:, :-1]],
++                dim=1,
++            ),
++            dim=1,
++        )  # [B, H]
++        gammas = (gamma ** torch.arange(H, dtype=torch.float32, device=rewards_h.device)
++                  ).unsqueeze(0)  # [1, H]
++        cum_rewards = (alive_mask * gammas * rewards_h).sum(dim=1, keepdim=True)  # [B, 1]
++
++        # alive after all H steps: prod_{j=0}^{H-1}(1 - done[j])
++        alive = torch.cumprod(survival, dim=1)[:, -1:]  # [B, 1]
++
+         # bootstrap: only if episode did not end before t+H
+         td_target = cum_rewards + (gamma**H) * alive * q_min_next  # [B, 1]
+ 

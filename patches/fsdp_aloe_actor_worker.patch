@@ -1,0 +1,371 @@
+diff --git a/rlinf/workers/actor/fsdp_aloe_actor_worker.py b/rlinf/workers/actor/fsdp_aloe_actor_worker.py
+index faaf2cd..bc626ad 100644
+--- a/rlinf/workers/actor/fsdp_aloe_actor_worker.py
++++ b/rlinf/workers/actor/fsdp_aloe_actor_worker.py
+@@ -33,6 +33,7 @@ import copy
+ import json
+ import os
+ import shutil
++from concurrent.futures import Future, ThreadPoolExecutor
+ from typing import Any
+ from typing import Optional
+ 
+@@ -89,6 +90,72 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+         self._bc_only: bool = False
+         self._freeze_replay: bool = False
+         self._bc_allowed_provenance: tuple[int, ...] = ()
++        # ALOE replay-save dirty bit (Patch A): only persist replay when in-memory
++        # state actually changed since the last save/load. Pure critic/actor
++        # training calls leave the buffer untouched and skip the rewrite.
++        self._replay_dirty: bool = False
++        # Path of the last on-disk replay we loaded from. When a save_checkpoint
++        # is called clean (no traj added since load), we drop a REPLAY_REF.txt
++        # pointing here so downstream resume_dir loads can chain back.
++        self._last_replay_load_path: Optional[str] = None
++        # 1-ahead prefetch: while GPU runs backward, load next batch from replay.
++        # Only ONE background task at a time; random_generator is accessed
++        # exclusively by the prefetch thread while the main thread does GPU work.
++        self._prefetch_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
++        self._critic_prefetch_fut: Optional[Future] = None
++        self._actor_prefetch_fut: Optional[Future] = None
++
++    # ---------------------------------------------------------------------- #
++    # Prefetch helpers                                                         #
++    # ---------------------------------------------------------------------- #
++
++    def _start_critic_prefetch(self) -> None:
++        """Submit next critic batch (sample_sequence_chunks) to background."""
++        self._critic_prefetch_fut = self._prefetch_executor.submit(
++            self.replay_buffer.sample_sequence_chunks,
++            self._critic_batch_size,
++            self._critic_sequence_len,
++        )
++
++    def _get_critic_batch(self) -> dict:
++        """Return prefetched critic batch if ready, else sample synchronously."""
++        if self._critic_prefetch_fut is not None:
++            batch = self._critic_prefetch_fut.result()
++            self._critic_prefetch_fut = None
++            return batch
++        return self.replay_buffer.sample_sequence_chunks(
++            self._critic_batch_size, self._critic_sequence_len
++        )
++
++    def _start_actor_prefetch(self) -> None:
++        """Submit next actor batch (sample_chunks) to background."""
++        self._actor_prefetch_fut = self._prefetch_executor.submit(
++            self.replay_buffer.sample_chunks,
++            self._actor_batch_size,
++        )
++
++    def _get_actor_batch(self) -> dict:
++        """Return prefetched actor batch if ready, else sample synchronously."""
++        if self._actor_prefetch_fut is not None:
++            batch = self._actor_prefetch_fut.result()
++            self._actor_prefetch_fut = None
++            return batch
++        return self.replay_buffer.sample_chunks(self._actor_batch_size)
++
++    def _drain_prefetch_future(self, fut: Optional[Future]) -> None:
++        """Wait for a pending prefetch future and discard its result.
++
++        Called at critic/actor block boundaries so the background thread
++        finishes before the next block touches random_generator on the main
++        thread (avoids a race on torch.Generator).
++        """
++        if fut is not None:
++            try:
++                fut.result()
++            except Exception:
++                pass
++
++    # ---------------------------------------------------------------------- #
+ 
+     def _copy_openpi_norm_stats_to_checkpoint(self, save_base_path: str) -> None:
+         """Keep OpenPI asset stats beside ALOE actor checkpoints for eval."""
+@@ -293,16 +360,39 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+             return
+ 
+         replay_path = str(replay_preload_path)
++        # Resolve to the per-rank subdirectory when needed.
++        # Case 1: path doesn't exist as a directory → try appending rank_N.
++        # Case 2: path is a directory but has no metadata.json (i.e. it's the
++        #         replay_buffer/ parent that contains rank_N/ children) → same.
+         if not os.path.isdir(replay_path):
+             rank_path = os.path.join(replay_path, f"rank_{self._rank}")
+             if os.path.isdir(rank_path):
+                 replay_path = rank_path
++        elif not os.path.isfile(os.path.join(replay_path, "metadata.json")):
++            rank_path = os.path.join(replay_path, f"rank_{self._rank}")
++            if os.path.isdir(rank_path):
++                replay_path = rank_path
+         self.replay_buffer.load_checkpoint(replay_path)
++        self._last_replay_load_path = replay_path
++        # Preloaded state is now in memory but on-disk path is the bootstrap;
++        # a subsequent save_checkpoint should persist this state to its own
++        # destination (e.g. when collect.sh later mutates and saves).
++        self._replay_dirty = True
+         self.log_info(
+             f"ALOE: preloaded replay buffer from {replay_path} "
+             f"with stats={self.replay_buffer.get_stats()}"
+         )
+ 
++        success_ratio = float(aloe_cfg.get("replay_success_ratio", 0.0))
++        if success_ratio > 0.0:
++            self.log_info(
++                f"ALOE: filtering replay buffer to success_ratio>={success_ratio}"
++            )
++            self.replay_buffer.filter_by_success_ratio(success_ratio)
++            self.log_info(
++                f"ALOE: after filter stats={self.replay_buffer.get_stats()}"
++            )
++
+     def _setup_q_curve_export(self, aloe_cfg: DictConfig) -> None:
+         self._q_curve_export_enabled = bool(
+             aloe_cfg.get("q_curve_export_enabled", False)
+@@ -452,6 +542,57 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+             self.model.train()
+         return put_tensor_device(context, self.device)
+ 
++    def _extract_critic_context_pair(
++        self,
++        forward_inputs_a: dict[str, torch.Tensor],
++        forward_inputs_b: dict[str, torch.Tensor],
++    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
++        """Fused ALOE_CRITIC forward for two batches; splits output back.
++
++        Reduces critic-step VLM calls from 2 to 1 by concatenating next and curr
++        forward_inputs along the batch dimension before calling the model.
++        Falls back to two separate calls if tensor shapes differ across inputs
++        (e.g., tokenized_prompt length mismatch across replay trajectories).
++        NOTE: safe only when critic_batch_size * 2 fits in VRAM (H800 ok up to ~128).
++        """
++        if not self._critic_use_pi05_context:
++            return {}, {}
++
++        first_key = next(iter(forward_inputs_a))
++        B_a = forward_inputs_a[first_key].shape[0]
++        B_b = forward_inputs_b[first_key].shape[0]
++
++        common_keys = set(forward_inputs_a) & set(forward_inputs_b)
++        shapes_match = all(
++            forward_inputs_a[k].shape[1:] == forward_inputs_b[k].shape[1:]
++            for k in common_keys
++            if torch.is_tensor(forward_inputs_a[k])
++        )
++        if not shapes_match:
++            return (
++                self._extract_critic_context(forward_inputs_a),
++                self._extract_critic_context(forward_inputs_b),
++            )
++
++        merged = {
++            k: torch.cat([forward_inputs_a[k], forward_inputs_b[k]], dim=0)
++            for k in common_keys
++            if torch.is_tensor(forward_inputs_a[k])
++        }
++        was_training = self.model.training
++        self.model.eval()
++        # extract_aloe_critic_context carries @torch.no_grad(); no extra wrapper needed.
++        context = self.model(
++            forward_type=ForwardType.ALOE_CRITIC,
++            forward_inputs=merged,
++        )
++        if was_training:
++            self.model.train()
++        context = put_tensor_device(context, self.device)
++        ctx_a = {k: v[:B_a] for k, v in context.items()}
++        ctx_b = {k: v[B_a : B_a + B_b] for k, v in context.items()}
++        return ctx_a, ctx_b
++
+     def _repeat_critic_context(
+         self,
+         context: dict[str, torch.Tensor],
+@@ -602,6 +743,7 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+         if self._freeze_replay:
+             return
+         self.replay_buffer.add_trajectories(recv_list)
++        self._replay_dirty = True
+ 
+     def compute_advantages_and_returns(self) -> dict:
+         """ALOE is off-policy; advantages are computed inline during training."""
+@@ -640,6 +782,10 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+                 append_to_dict(metrics, m)
+                 if m:
+                     self._soft_update_target_critic()
++            # Drain any stale critic prefetch before actor block uses
++            # random_generator on the main thread (avoids torch.Generator race).
++            self._drain_prefetch_future(self._critic_prefetch_fut)
++            self._critic_prefetch_fut = None
+ 
+         # ---- Actor updates ---- #
+         self.model.train()
+@@ -649,6 +795,9 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+             else:
+                 m = self._run_actor_update_step()
+             append_to_dict(metrics, m)
++        # Drain any stale actor prefetch before this call returns.
++        self._drain_prefetch_future(self._actor_prefetch_fut)
++        self._actor_prefetch_fut = None
+ 
+         self._update_step += 1
+ 
+@@ -666,9 +815,7 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+         Samples a sequence batch, computes TD targets using the target critic,
+         and minimises MSE between the online critic and the TD target.
+         """
+-        batch = self.replay_buffer.sample_sequence_chunks(
+-            self._critic_batch_size, chunk_len=self._critic_sequence_len
+-        )
++        batch = self._get_critic_batch()
+         if not batch:
+             return {}
+ 
+@@ -702,7 +849,18 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+         if not next_forward_inputs:
+             return {}
+         next_forward_inputs = put_tensor_device(next_forward_inputs, self.device)
+-        next_context = self._extract_critic_context(next_forward_inputs)
++
++        # Fetch forward_inputs here (for curr state) so both context extractions
++        # can be fused into one batched VLM forward via _extract_critic_context_pair.
++        forward_inputs = batch.get("forward_inputs", {})
++        if not forward_inputs:
++            return {}
++        forward_inputs_on_device = put_tensor_device(forward_inputs, self.device)
++
++        # One batched ALOE_CRITIC forward instead of two sequential ones.
++        next_context, curr_context = self._extract_critic_context_pair(
++            next_forward_inputs, forward_inputs_on_device
++        )
+ 
+         # ---- Rewards and dones ---- #
+         # RLinf stores one VLA action chunk per replay transition. The paper's
+@@ -745,11 +903,7 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+ 
+         # ---- Compute online critic prediction ---- #
+         self.qf_optimizer.zero_grad()
+-        forward_inputs = batch.get("forward_inputs", {})
+-        if not forward_inputs:
+-            return {}
+-        forward_inputs_on_device = put_tensor_device(forward_inputs, self.device)
+-        curr_context = self._extract_critic_context(forward_inputs_on_device)
++        # curr_context already computed above via _extract_critic_context_pair.
+         q_pred = self.critic_model(curr_states, actions_3d, **curr_context)  # [B, K]
+         critic_loss, critic_metrics = compute_aloe_critic_loss(q_pred, td_target)
+         critic_loss.backward()
+@@ -788,6 +942,8 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+             self._tau,
+             device=self.device,
+         )
++        # Kick off prefetch of next critic batch while caller does soft-update.
++        self._start_critic_prefetch()
+         return critic_metrics
+ 
+     # ---------------------------------------------------------------------- #
+@@ -802,7 +958,7 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+         and applies advantage-weighted flowmatching loss.
+         """
+         # Sample standard single-step batch (with forward_inputs for VLM)
+-        batch = self.replay_buffer.sample_chunks(self._actor_batch_size)
++        batch = self._get_actor_batch()
+         if not batch:
+             return {}
+ 
+@@ -884,6 +1040,8 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+         actor_metrics["actor/aloe_adv_mean"] = aloe_advantages.mean().detach()
+         actor_metrics["actor/aloe_adv_min"] = aloe_advantages.min().detach()
+         actor_metrics["actor/aloe_adv_max"] = aloe_advantages.max().detach()
++        # Kick off prefetch of next actor batch while caller does bookkeeping.
++        self._start_actor_prefetch()
+         return actor_metrics
+ 
+     def _run_bc_actor_update_step(self) -> dict:
+@@ -988,11 +1146,22 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+             critic_save_path,
+         )
+ 
+-        # ---- Replay buffer ---- #
++        # ---- Replay buffer (Patch A: dirty-bit conditional save + chain ref) #
+         buffer_save_path = os.path.join(
+             save_base_path, f"aloe_components/replay_buffer/rank_{self._rank}"
+         )
+-        self.replay_buffer.save_checkpoint(buffer_save_path)
++        if self._replay_dirty:
++            self.replay_buffer.save_checkpoint(buffer_save_path)
++            self._replay_dirty = False
++            self._last_replay_load_path = buffer_save_path
++        else:
++            # In-memory replay matches what is already on disk at
++            # `_last_replay_load_path`. Skip the rewrite; drop a REPLAY_REF.txt
++            # so downstream resume_dir loads can follow back to the real data.
++            os.makedirs(buffer_save_path, exist_ok=True)
++            ref_path = os.path.join(buffer_save_path, "REPLAY_REF.txt")
++            with open(ref_path, "w") as f:
++                f.write(self._last_replay_load_path or "")
+ 
+     def load_checkpoint(self, load_base_path: str) -> None:
+         """Load actor, critic, target critic, and replay buffer from checkpoint."""
+@@ -1025,11 +1194,24 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+             self.critic_model.load_state_dict(ckpt["critic"])
+             self.target_critic.load_state_dict(ckpt["target_critic"])
+             self.qf_optimizer.load_state_dict(ckpt["qf_optimizer"])
++            # Patch B: optional cosine restart per-call.
++            reset_lr = bool(
++                self.cfg.actor.get("critic_optim", {}).get(
++                    "reset_scheduler_on_load", False
++                )
++            )
+             if (
+                 self.qf_lr_scheduler is not None
+                 and ckpt.get("qf_lr_scheduler") is not None
++                and not reset_lr
+             ):
+                 self.qf_lr_scheduler.load_state_dict(ckpt["qf_lr_scheduler"])
++            elif reset_lr:
++                self.log_info(
++                    "ALOE: actor.critic_optim.reset_scheduler_on_load=True "
++                    "→ skipping qf_lr_scheduler.load_state_dict; "
++                    "scheduler restarts from last_epoch=0."
++                )
+             self._update_step = int(ckpt.get("update_step", 0))
+             self._critic_update_step = int(
+                 ckpt.get("critic_update_step", self._update_step * self._N_Q)
+@@ -1044,12 +1226,35 @@ class ALOEFSDPActorWorker(EmbodiedFSDPActor):
+                 f"ALOE: no critic checkpoint at {critic_load_path}, skipping."
+             )
+ 
+-        # ---- Replay buffer ---- #
++        # ---- Replay buffer (Patch A: follow REPLAY_REF.txt if present) ---- #
+         buffer_load_path = os.path.join(
+             load_base_path, f"aloe_components/replay_buffer/rank_{self._rank}"
+         )
+         if os.path.isdir(buffer_load_path):
+-            self.replay_buffer.load_checkpoint(buffer_load_path)
++            ref_path = os.path.join(buffer_load_path, "REPLAY_REF.txt")
++            has_traj_files = any(
++                fn.endswith(".pt") or fn == "metadata.json"
++                for fn in os.listdir(buffer_load_path)
++            )
++            resolved_path = buffer_load_path
++            if (not has_traj_files) and os.path.isfile(ref_path):
++                with open(ref_path, "r") as f:
++                    real_path = f.read().strip()
++                if real_path and os.path.isdir(real_path):
++                    resolved_path = real_path
++                    self.log_info(
++                        f"ALOE: replay REPLAY_REF.txt → {real_path}"
++                    )
++                else:
++                    self.log_warning(
++                        f"ALOE: REPLAY_REF.txt at {ref_path} points to "
++                        f"missing path {real_path!r}; replay not loaded."
++                    )
++                    resolved_path = None
++            if resolved_path is not None:
++                self.replay_buffer.load_checkpoint(resolved_path)
++                self._last_replay_load_path = resolved_path
++                self._replay_dirty = False
+ 
+     # ---------------------------------------------------------------------- #
+     # Metrics                                                                  #
